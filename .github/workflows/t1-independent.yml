@@ -1,0 +1,152 @@
+name: DIAMOND-001 independent verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      approved_commit:
+        description: D-approved verification-repository commit (40 hex)
+        required: true
+        type: string
+      approved_yaml_sha256:
+        description: D-approved t1-independent.yml SHA-256
+        required: true
+        type: string
+      input_asset_id:
+        description: D-approved encrypted release-asset numeric ID in this repository
+        required: true
+        type: string
+      input_cipher_sha256:
+        description: D-approved encrypted input asset SHA-256
+        required: true
+        type: string
+      approval_reference:
+        description: Public nonsecret identifier for D final advance approval
+        required: true
+        type: string
+      publication_approved:
+        description: Owner approved public CI metadata and ciphertext only
+        required: true
+        default: false
+        type: boolean
+      zero_cost_checked:
+        description: Owner checked storage allowance and paid usage is blocked
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diamond-001-independent
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      APPROVED_COMMIT: ${{ inputs.approved_commit }}
+      APPROVED_YAML_SHA256: ${{ inputs.approved_yaml_sha256 }}
+      INPUT_ASSET_ID: ${{ inputs.input_asset_id }}
+      INPUT_CIPHER_SHA256: ${{ inputs.input_cipher_sha256 }}
+      APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+      PUBLICATION_APPROVED: ${{ inputs.publication_approved }}
+      ZERO_COST_CHECKED: ${{ inputs.zero_cost_checked }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
+      REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - name: Initialize public metadata directory
+        run: |
+          CI_ROOT="$RUNNER_TEMP/diamond-ci"
+          printf 'CI_ROOT=%s\n' "$CI_ROOT" >> "$GITHUB_ENV"
+          mkdir -p "$CI_ROOT/public" "$CI_ROOT/private"
+          chmod 700 "$CI_ROOT/private"
+          printf 'run_id=%s\nattempt=%s\nactor=%s\ntriggering_actor=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_ACTOR" "$GITHUB_TRIGGERING_ACTOR" \
+            > "$CI_ROOT/public/bootstrap.txt"
+
+      - name: Checkout exact dispatched CI configuration
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify approval binding and record hosted environment
+        run: python3 tools/ci_verify.py qualify
+
+      - name: Set exact application Node runtime without dependency cache
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '24.19.0'
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Download the approved ciphertext release asset (read only)
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$INPUT_ASSET_ID" \
+            > "$CI_ROOT/public/input-asset.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$INPUT_ASSET_ID" \
+            -H 'Accept: application/octet-stream' \
+            > "$CI_ROOT/private/inputs.tar.gpg"
+          python3 tools/ci_verify.py cipher-check
+
+      - name: Decrypt and verify immutable inputs before execution
+        timeout-minutes: 10
+        env:
+          CI_PASSPHRASE: ${{ secrets.CI_PASSPHRASE }}
+        run: python3 tools/ci_verify.py unpack
+
+      - name: Run unchanged recovery gates in one hosted job
+        id: gates
+        timeout-minutes: 125
+        run: python3 tools/ci_verify.py execute
+
+      - name: Always seal complete or partial evidence
+        if: ${{ always() }}
+        timeout-minutes: 15
+        env:
+          CI_PASSPHRASE: ${{ secrets.CI_PASSPHRASE }}
+          GATE_OUTCOME: ${{ steps.gates.outcome }}
+        run: |
+          if test -f tools/ci_verify.py; then
+            python3 tools/ci_verify.py seal
+          else
+            printf '%s\n' 'Checkout failed; no execution evidence available.' > "$CI_ROOT/public/INCOMPLETE.txt"
+            exit 1
+          fi
+
+      - name: Always upload ciphertext and public metadata only
+        if: ${{ always() }}
+        id: artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: diamond-t1-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diamond-ci/public/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Record GitHub artifact receipt
+        if: ${{ always() }}
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: |
+          printf 'artifact_id=%s\nartifact_digest=%s\nartifact_url=%s\n' \
+            "$ARTIFACT_ID" "$ARTIFACT_DIGEST" "$ARTIFACT_URL"
+          printf 'Attribution: GITHUB_HOSTED_CI_EXECUTED / D_EVIDENCE_REVIEWED\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'Artifact ID: %s; SHA-256: %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          test -n "$ARTIFACT_ID"
